@@ -432,6 +432,7 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
   struct WritePortInfo {
     Value addr;
     Value en;
+    Value mask;
   };
   SmallVector<WritePortInfo> writePortConflictInfos;
 
@@ -519,25 +520,59 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
 
     // Collect signals for collision detection.
     if (mem.readUnderWrite == seq::RUW::Undefined && mem.readLatency > 0)
-      writePortConflictInfos.push_back({addr, en});
+      writePortConflictInfos.push_back({addr, en, wmaskBits});
   }
 
   // Resolve Undefined RUW collisions for read ports.
   for (auto &rp : readPortConflictsPending) {
-    Value collision = b.createOrFold<ConstantOp>(b.getI1Type(), 0);
+    // Pre-compute address match & enable for each write port.
+    SmallVector<Value> wpCollisions;
     for (auto &wp : writePortConflictInfos) {
-      // Compare read and write addresses
       Value addrMatch = b.createOrFold<comb::ICmpOp>(
           comb::ICmpPredicate::eq, rp.addr, wp.addr, false);
-      Value thisCollision =
-          b.createOrFold<comb::AndOp>(wp.en, addrMatch, false);
-      collision =
-          b.createOrFold<comb::OrOp>(collision, thisCollision, false);
+      wpCollisions.push_back(
+          b.createOrFold<comb::AndOp>(wp.en, addrMatch, false));
     }
 
-    Value x = sv::ConstantXOp::create(b, rp.data.getType());
-    Value result = comb::MuxOp::create(b, collision, x, rp.data, false);
-    sv::AssignOp::create(b, rp.rWire, result);
+    if (!isMasked) {
+      // No mask: OR all collisions and X the entire word.
+      Value collision = b.createOrFold<ConstantOp>(b.getI1Type(), 0);
+      for (auto c : wpCollisions)
+        collision = b.createOrFold<comb::OrOp>(collision, c, false);
+      Value x = sv::ConstantXOp::create(b, rp.data.getType());
+      Value result = comb::MuxOp::create(b, collision, x, rp.data, false);
+      sv::AssignOp::create(b, rp.rWire, result);
+    } else {
+      // Masked: extract per-write-port mask bits, then for each granule,
+      // X out only the bits where the corresponding mask bit is set.
+      SmallVector<SmallVector<Value, 4>> wpMaskValues(
+          writePortConflictInfos.size(), SmallVector<Value, 4>(maskBits));
+      for (auto [wpIdx, wp] : llvm::enumerate(writePortConflictInfos))
+        for (size_t g = 0; g < maskBits; ++g)
+          wpMaskValues[wpIdx][g] =
+              b.createOrFold<comb::ExtractOp>(wp.mask, g, 1);
+
+      SmallVector<Value> granules;
+      for (size_t g = 0; g < maskBits; ++g) {
+        // Guard by corresponding mask bit for each write port.
+        Value collision = b.createOrFold<ConstantOp>(b.getI1Type(), 0);
+        for (auto [wpIdx, wp] : llvm::enumerate(writePortConflictInfos)) {
+          auto wcond = b.createOrFold<comb::AndOp>(
+              wpCollisions[wpIdx], wpMaskValues[wpIdx][g], false);
+          collision = b.createOrFold<comb::OrOp>(collision, wcond, false);
+        }
+        Value dataGranule = b.createOrFold<comb::ExtractOp>(
+            rp.data, g * mem.maskGran, mem.maskGran);
+        Value xGranule =
+            sv::ConstantXOp::create(b, dataGranule.getType());
+        granules.push_back(comb::MuxOp::create(
+            b, collision, xGranule, dataGranule, false));
+      }
+      // ConcatOp takes values in MSB-first order.
+      std::reverse(granules.begin(), granules.end());
+      Value result = b.createOrFold<comb::ConcatOp>(granules);
+      sv::AssignOp::create(b, rp.rWire, result);
+    }
   }
 
   auto *outputOp = op.getBodyBlock()->getTerminator();
