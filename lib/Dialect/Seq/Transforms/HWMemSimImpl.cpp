@@ -227,26 +227,39 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
 
   SmallVector<Value, 4> outputs;
 
+  // Information about read ports that need collision detection
+  // (for RUW::Undefined mode).
+  struct ReadPortConflictInfo {
+    Value rWire;  // the wire to assign the collision result to
+    Value data;
+    Value addr;
+  };
+  SmallVector<ReadPortConflictInfo> readPortConflictsPending;
+
   size_t inArg = 0;
   for (size_t i = 0; i < mem.numReadPorts; ++i) {
     Value addr = op.getBody().getArgument(inArg++);
     Value en = op.getBody().getArgument(inArg++);
     Value clock = op.getBody().getArgument(inArg++);
     // Add pipeline stages
-    if (readEnableMode == ReadEnableMode::Ignore) {
-      for (size_t j = 0, e = mem.readLatency; j != e; ++j) {
-        auto enLast = en;
-        if (j < e - 1)
-          en = addPipelineStages(b, moduleNamespace, 1, clock, en,
-                                 "R" + Twine(i) + "_en");
-        addr = addPipelineStages(b, moduleNamespace, 1, clock, addr,
-                                 "R" + Twine(i) + "_addr", enLast);
+    // For New: pipeline address and enable before reading.
+    // For Old/Undefined: leave addr/en raw and pipeline the data after reading.
+    if (mem.readUnderWrite == seq::RUW::New) {
+      if (readEnableMode == ReadEnableMode::Ignore) {
+        for (size_t j = 0, e = mem.readLatency; j != e; ++j) {
+          auto enLast = en;
+          if (j < e - 1)
+            en = addPipelineStages(b, moduleNamespace, 1, clock, en,
+                                   "R" + Twine(i) + "_en");
+          addr = addPipelineStages(b, moduleNamespace, 1, clock, addr,
+                                   "R" + Twine(i) + "_addr", enLast);
+        }
+      } else {
+        en = addPipelineStages(b, moduleNamespace, mem.readLatency, clock, en,
+                               "R" + Twine(i) + "_en");
+        addr = addPipelineStages(b, moduleNamespace, mem.readLatency, clock, addr,
+                                 "R" + Twine(i) + "_addr");
       }
-    } else {
-      en = addPipelineStages(b, moduleNamespace, mem.readLatency, clock, en,
-                             "R" + Twine(i) + "_en");
-      addr = addPipelineStages(b, moduleNamespace, mem.readLatency, clock, addr,
-                               "R" + Twine(i) + "_addr");
     }
 
     // Read Logic
@@ -264,6 +277,24 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     }
     case ReadEnableMode::Ignore:
       break;
+    }
+
+    if (mem.readUnderWrite != seq::RUW::New) {
+      // Old/Undefined: pipeline the read data for readLatency stages.
+      // For Undefined, only create a wire here and store the read data.
+      // The actual read value is determined after write ports are created,
+      // possibly X if there is a collision.
+      Value pipeInput = rdata;
+      if (mem.readUnderWrite == seq::RUW::Undefined &&
+          mem.readLatency > 0) {
+        auto rWire = sv::WireOp::create(
+            b, rdata.getType(), b.getStringAttr("R" + Twine(i) + "_col"));
+        Value rWireRead = sv::ReadInOutOp::create(b, rWire);
+        readPortConflictsPending.push_back({rWire, rdata, addr});
+        pipeInput = rWireRead;
+      }
+      rdata = addPipelineStages(b, moduleNamespace, mem.readLatency, clock,
+                                pipeInput, "R" + Twine(i) + "_data");
     }
     outputs.push_back(rdata);
   }
@@ -397,6 +428,13 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     outputs.push_back(rdata);
   }
 
+  // Write port signals for collision detection.
+  struct WritePortInfo {
+    Value addr;
+    Value en;
+  };
+  SmallVector<WritePortInfo> writePortConflictInfos;
+
   DenseMap<unsigned, Operation *> writeProcesses;
   for (size_t i = 0; i < mem.numWritePorts; ++i) {
     auto numStages = mem.writeLatency - 1;
@@ -478,6 +516,28 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
         writeProcesses[i] = alwaysBlock();
       }
     }
+
+    // Collect signals for collision detection.
+    if (mem.readUnderWrite == seq::RUW::Undefined && mem.readLatency > 0)
+      writePortConflictInfos.push_back({addr, en});
+  }
+
+  // Resolve Undefined RUW collisions for read ports.
+  for (auto &rp : readPortConflictsPending) {
+    Value collision = b.createOrFold<ConstantOp>(b.getI1Type(), 0);
+    for (auto &wp : writePortConflictInfos) {
+      // Compare read and write addresses
+      Value addrMatch = b.createOrFold<comb::ICmpOp>(
+          comb::ICmpPredicate::eq, rp.addr, wp.addr, false);
+      Value thisCollision =
+          b.createOrFold<comb::AndOp>(wp.en, addrMatch, false);
+      collision =
+          b.createOrFold<comb::OrOp>(collision, thisCollision, false);
+    }
+
+    Value x = sv::ConstantXOp::create(b, rp.data.getType());
+    Value result = comb::MuxOp::create(b, collision, x, rp.data, false);
+    sv::AssignOp::create(b, rp.rWire, result);
   }
 
   auto *outputOp = op.getBodyBlock()->getTerminator();
