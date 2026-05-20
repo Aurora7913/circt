@@ -15,6 +15,7 @@
 
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Support/Debug.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -87,6 +88,12 @@ void EliminateWiresPass::runOnOperation() {
     auto node = NodeOp::create(builder, writer.getSrc(), wire.getName(),
                                wire.getNameKind(), wire.getAnnotations(),
                                wire.getInnerSymAttr(), wire.getForceable());
+    // Preserve sv.attributes (e.g. mark_debug) set by LowerAnnotations from
+    // firrtl.AttributeAnnotation. Without this, the attributes are silently
+    // dropped when a WireOp is converted to a NodeOp, causing addAttribute()
+    // annotations to never appear in the emitted SV.
+    if (auto svAttrs = sv::getSVAttributes(wire))
+      sv::setSVAttributes(node, svAttrs);
     wire.replaceAllUsesWith(node);
     wire.erase();
     writer.erase();
